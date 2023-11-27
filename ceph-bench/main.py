@@ -1,22 +1,10 @@
-#!/usr/bin/env python3
-
-# Copyright 2018 Canonical Ltd.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+#! /usr/bin/env python3
 
 import argparse
+import ast
 import asyncio
 import os
+import subprocess
 import sys
 import tempfile
 import yaml
@@ -27,18 +15,31 @@ from zaza.controller import add_model
 import zaza.model as model
 
 
-DEFAULT_APPS = {
+BASIC_APPS = {
     'ceph-mon': {'charm': 'ch:ceph-mon', 'num_units': 3,
                  'options': {'monitor-count': 3},
                  'to': ['0', '1', '2']},
+    'woodpecker': {'num_units': 1, 'to': ['3']}
+}
+
+EXTRA_APPS = {
     'ceph-radosgw': {'charm': 'ch:ceph-radosgw', 'num_units': 1,
-                     'to': ['3']},
+                     'to': ['4']},
     'vault-mysql-router': {'charm': 'ch:mysql-router'},
     'mysql-innodb-cluster': {'charm': 'ch:mysql-innodb-cluster',
-                             'num_units': 3, 'to': ['4', '5', '6']},
-    'vault': {'charm': 'ch:vault', 'num_units': 1, 'to': ['7']},
-    'woodpecker': {'num_units': 1, 'to': ['8']}
+                             'num_units': 3, 'to': ['5', '6', '7']},
+    'vault': {'charm': 'ch:vault', 'num_units': 1, 'to': ['8']},
 }
+
+
+def zaza_cleanup(fn):
+    def inner(*args):
+        try:
+            fn(*args)
+        finally:
+          zaza.clean_up_libjuju_thread()
+          asyncio.get_event_loop().close()
+    return inner
 
 
 def parse_args(args):
@@ -63,6 +64,9 @@ def parse_args(args):
                         help='Machine constraints to pass to Juju')
     parser.add_argument('-P', '--ppa',
                         help='PPA to use for Ceph packages')
+    parser.add_argument('-R', '--rados',
+                        help='Whether to deploy the Rados gateway charm',
+                        action='store_true')
     return parser.parse_args(args)
 
 
@@ -94,7 +98,21 @@ def make_deploy_dict(args):
     """
     Generate a dict with all the specifications for a Juju deployment.
     """
-    apps = DEFAULT_APPS.copy()
+
+    relations = [
+        ['ceph-mon:osd', 'ceph-osd:mon'],
+        ['woodpecker:ceph-client', 'ceph-mon:client']
+    ]
+
+    apps = BASIC_APPS.copy()
+    if args.rados:
+        apps.update(EXTRA_APPS)
+        relations.extend([
+            ['vault:shared-db', 'vault-mysql-router:shared-db'],
+            ['vault-mysql-router:db-router', 'mysql-innodb-cluster:db-router'],
+            ['ceph-radosgw:mon', 'ceph-mon:radosgw']
+        ])
+
     apps['woodpecker'].update({'series': args.series,
                                'charm': args.woodpecker})
     osd = {'charm': 'ch:ceph-osd', 'num_units': args.num_osds,
@@ -113,16 +131,11 @@ def make_deploy_dict(args):
     ret['applications'] = apps
     ret['machines'] = get_machine_list(args, apps, osd)
     ret['series'] = args.series
-    ret['relations'] = [
-        ['vault:shared-db', 'vault-mysql-router:shared-db'],
-        ['vault-mysql-router:db-router', 'mysql-innodb-cluster:db-router'],
-        ['ceph-mon:osd', 'ceph-osd:mon'],
-        ['woodpecker:ceph-client', 'ceph-mon:client'],
-        ['ceph-radosgw:mon', 'ceph-mon:radosgw']
-    ]
+    ret['relations'] = relations
     return ret
 
 
+@zaza_cleanup
 def deploy(args):
     """
     Deploy a Juju model suitable to run Ceph benchmarking.
@@ -141,6 +154,7 @@ def deploy(args):
     fp = open(path, 'w')
 
     try:
+        subprocess.call(['juju', 'switch', model])
         yaml.dump(data, fp, default_flow_style=False)
         fp.close()
         juju_deploy(path, model, test_directory=cur_dir)
@@ -148,21 +162,43 @@ def deploy(args):
         os.remove(path)
 
 
+def extract_nums(line):
+    line = line.split()
+    return (int(line[1]), float(line[3]), float(line[5]))
+
+
+def extract_fio_info(jobs, key, out):
+    ops = jobs.get(key)
+    if ops:
+        out[key] = (ops['total_ios'], ops['iops'], ops['bw'])
+
+
 def get_parser(name):
     def parse_fio(msg):
-        pass
+        tab = ast.literal_eval(msg)
+        jobs = tab['jobs'][0]
+        ret = {'elapsed': jobs['elapsed']}
+        extract_fio_info(jobs, 'read', ret)
+        extract_fio_info(jobs, 'write', ret)
+        return ret
 
     def parse_rbd_bench(msg):
-        pass
+        lines = msg.split('\n')
+        ret = {}
+        for line in lines:
+            if 'read_ops' in line:
+                ret['read'] = extract_nums(line)
+            elif 'write_ops' in line:
+                ret['write'] = extract_nums(line)
+            elif 'elapsed' in line:
+                ret['elapsed'] = [extract_nums(line)[0]]
+
+        return ret
 
     def parse_rados_bench(msg):
-        pass
+        raise NotImplementedError('Not implemented yet')
 
-    def dummy(msg):
-        with open('/home/ubuntu/xxx', 'w') as f:
-            f.write(msg)
 
-    return dummy
     if name == 'fio':
         return parse_fio
     elif name == 'rbd-bench':
@@ -171,6 +207,40 @@ def get_parser(name):
         return parse_rados_bench
 
 
+def convert_action_params(action, params):
+    try:
+        actions = subprocess.check_output(['juju', 'actions', 'woodpecker',
+                                           '--schema', '--format', 'yaml'])
+        actions = yaml.safe_load(actions.decode('utf8'))
+        action_keys = actions[action]['properties']
+        for key, val in params.items():
+            if key not in action_keys:
+                continue
+            typ = action_keys[key].get('type')
+            if typ == 'integer':
+                params[key] = int(val)
+            elif typ == 'number':
+                params[key] = float(val)
+    except Exception as exc:
+        print('Failed to update action parameters ', str(exc))
+
+
+def print_results(parsed_data, name):
+    print('Run benchmark: ', name)
+
+    read_ops, write_ops = parsed_data['read'], parsed_data['write']
+    elapsed = parsed_data['elapsed']
+
+    print('Elapsed time: %f\tops: %d\tops/sec: %f\tBW: %f\n' %
+          (elapsed, read_ops[0] + write_ops[0],
+           (read_ops[0] + write_ops[0]) / elapsed,
+           read_ops[2] + write_ops[2]))
+
+    print('Read ops: %d\tread_ops/sec: %f\tread BW: %f\n' % read_ops)
+    print('Write ops: %d\twrite ops/sec: %f\twrite BW: %f\n' % write_ops)
+
+
+@zaza_cleanup
 def run_benchmark(args):
     """
     Run a specific benchmarking action and display the results.
@@ -183,6 +253,7 @@ def run_benchmark(args):
 
     action_args = zip(*(iter(args[1:]),) * 2)
     action_args = {x[0]: x[1] for x in action_args}
+    convert_action_params(action_name, action_args)
     result = model.run_action(
         unit_name='woodpecker/0',
         action_name=action_name,
@@ -192,13 +263,17 @@ def run_benchmark(args):
         print('Benchmark failed: ', result.data['message'])
         return
 
-    parser(result.data['results']['message'])
+    rv = parser(result.data['results']['test-results'])
+    try:
+        print_results(rv, action_name)
+    except Exception as exc:
+        print('Failed to print results: ', str(exc))
 
 
 def main():
     argv = sys.argv
     if len(argv) < 2:
-        print('usage: ceph-bench deploy|run ...args')
+        print('usage: %s deploy|run ...args' % argv[0])
         return
 
     command = argv[1]
