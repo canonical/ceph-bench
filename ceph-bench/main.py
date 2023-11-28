@@ -226,18 +226,21 @@ def convert_action_params(action, params):
 
 
 def print_results(parsed_data, name):
-    print('Run benchmark: ', name)
+    print('ran benchmark: ', name)
 
     read_ops, write_ops = parsed_data['read'], parsed_data['write']
+    num_ops = read_ops[0] + write_ops[0]
     elapsed = parsed_data['elapsed']
 
-    print('Elapsed time: %f\tops: %d\tops/sec: %f\tBW: %f\n' %
-          (elapsed, read_ops[0] + write_ops[0],
-           (read_ops[0] + write_ops[0]) / elapsed,
-           read_ops[2] + write_ops[2]))
-
-    print('Read ops: %d\tread_ops/sec: %f\tread BW: %f\n' % read_ops)
-    print('Write ops: %d\twrite ops/sec: %f\twrite BW: %f\n' % write_ops)
+    print((f'elapsed time:\t{elapsed:.2f}\t'
+           f'ops/sec:\t{num_ops/elapsed:.2f}\t\t'
+           f'bandwidth:\t{read_ops[2]+write_ops[2]}'))
+    print((f'read ops:\t{read_ops[0]}\t'
+           f'read_ops/sec:\t{read_ops[1]:.2f}\t\t'
+           f'read BW:\t{read_ops[2]}'))
+    print((f'write ops:\t{write_ops[0]}\t'
+           f'write_ops/sec:\t{write_ops[1]:.2f}\t\t'
+           f'write BW:\t{write_ops[2]}'))
 
 
 @zaza_cleanup
