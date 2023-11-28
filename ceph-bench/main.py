@@ -120,13 +120,13 @@ def make_deploy_dict(args):
     apps['ceph-osd'] = osd
     ret = {}
 
-
     if args.storage:
         osd['storage'] = {'osd-devices': args.storage}
     if args.ppa:
         source = {'source': args.ppa}
-        for app in (osd, apps['ceph-mon'], apps['ceph-radosgw']):
-            app['options'] = source
+        for app_name, app in apps.items():
+            if 'ceph-' in app_name:
+                app['options'] = source
 
     ret['applications'] = apps
     ret['machines'] = get_machine_list(args, apps, osd)
@@ -154,9 +154,9 @@ def deploy(args):
     fp = open(path, 'w')
 
     try:
-        subprocess.call(['juju', 'switch', model])
         yaml.dump(data, fp, default_flow_style=False)
         fp.close()
+        subprocess.call(['juju', 'switch', model])
         juju_deploy(path, model, test_directory=cur_dir)
     finally:
         os.remove(path)
@@ -191,7 +191,7 @@ def get_parser(name):
             elif 'write_ops' in line:
                 ret['write'] = extract_nums(line)
             elif 'elapsed' in line:
-                ret['elapsed'] = [extract_nums(line)[0]]
+                ret['elapsed'] = extract_nums(line)[0]
 
         return ret
 
@@ -279,11 +279,7 @@ def main():
     command = argv[1]
     argv = argv[2:]
     if command == 'deploy':
-        try:
-            deploy(parse_args(argv))
-        finally:
-            zaza.clean_up_libjuju_thread()
-            asyncio.get_event_loop().close()
+        deploy(parse_args(argv))
     elif command == 'run':
         run_benchmark(argv)
 
